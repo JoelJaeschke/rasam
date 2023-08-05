@@ -19,6 +19,13 @@
 #include "cpl_string.h"
 
 using GeoTransform = std::array<double, 6>;
+using ArrayIndex_t = uint32_t;
+using Row = ArrayIndex_t;
+using Column = ArrayIndex_t;
+using ArrayCoordinate = std::pair<Column, Row>;
+using Latitude = double;
+using Longitude = double;
+using GeographicCoordinate = std::pair<Longitude, Latitude>;
 
 struct Arguments {
 public:
@@ -28,24 +35,28 @@ public:
     std::string input_raster;
     std::string input_points;
     std::string output_points;
+    std::string output_format;
 
     Arguments(): raster_band(1),
                  cache_size(64),
                  point_layer(""),
                  input_raster(""),
                  input_points(""),
-                 output_points("") {};
+                 output_points(""),
+                 output_format("GPKG") {};
     Arguments(const size_t raster_band,
               const size_t cache_size,
               const std::string point_layer,
               const std::string input_raster,
               const std::string input_points,
-              const std::string output_points): raster_band(raster_band),
+              const std::string output_points,
+              const std::string output_format): raster_band(raster_band),
                                                 cache_size(cache_size),
                                                 point_layer(point_layer),
                                                 input_raster(input_raster),
                                                 input_points(input_points),
-                                                output_points(output_points) {};
+                                                output_points(output_points),
+                                                output_format(output_format) {};
     ~Arguments() = default;
 };
 
@@ -62,15 +73,15 @@ public:
     ~RasterShape() = default;
 };
 
-std::pair<size_t, size_t> projection_to_rowcol(const GeoTransform& gt, const std::pair<double, double>& point) {
+ArrayCoordinate projection_to_rowcol(const GeoTransform& gt, const GeographicCoordinate& point) {
     return std::make_pair(
-        static_cast<size_t>((point.first - gt[0]) / gt[1]),
-        static_cast<size_t>((point.second - gt[3]) / gt[5])
+        static_cast<ArrayIndex_t>((point.first - gt[0]) / gt[1]),
+        static_cast<ArrayIndex_t>((point.second - gt[3]) / gt[5])
     );
 }
 
-std::vector<std::pair<size_t, size_t>> projection_to_rowcol(const GeoTransform& gt, const std::vector<std::pair<double, double>>& points) {
-    std::vector<std::pair<size_t, size_t>> output{};
+std::vector<ArrayCoordinate> projection_to_rowcol(const GeoTransform& gt, const std::vector<GeographicCoordinate>& points) {
+    std::vector<ArrayCoordinate> output{};
     output.reserve(points.size());
     
     std::transform(points.begin(), points.end(), std::back_inserter(output), [&gt](const auto& elem) {
@@ -80,15 +91,15 @@ std::vector<std::pair<size_t, size_t>> projection_to_rowcol(const GeoTransform& 
     return output;
 }
 
-std::pair<double, double> rowcol_to_projection(const GeoTransform& gt, const std::pair<size_t, size_t>& point) {
+GeographicCoordinate rowcol_to_projection(const GeoTransform& gt, const ArrayCoordinate& point) {
     return std::make_pair(
         gt[1] * point.first + gt[2] * point.second + gt[1] * 0.5 + gt[2] * 0.5 + gt[0],
         gt[4] * point.first + gt[5] * point.second + gt[4] * 0.5 + gt[5] * 0.5 + gt[3]
     );
 }
 
-std::vector<std::pair<double, double>> rowcol_to_projection(const GeoTransform& gt, const std::vector<std::pair<size_t, size_t>>& points) {
-    std::vector<std::pair<double, double>> output{};
+std::vector<GeographicCoordinate> rowcol_to_projection(const GeoTransform& gt, const std::vector<ArrayCoordinate>& points) {
+    std::vector<GeographicCoordinate> output{};
     output.reserve(points.size());
     
     std::transform(points.begin(), points.end(), std::back_inserter(output), [&gt](const auto& elem) {
@@ -98,8 +109,23 @@ std::vector<std::pair<double, double>> rowcol_to_projection(const GeoTransform& 
     return output;
 }
 
-std::vector<std::pair<double, double>> read_points_from_geofile(OGRLayer* layer) {
-    std::vector<std::pair<double, double>> points{};
+size_t rowcol_to_linear_index(const ArrayCoordinate& rowcol, const RasterShape& rs) {
+    const size_t x_block = std::floor(rowcol.first / rs.blockxsize);
+    const size_t y_block = std::floor(rowcol.second / rs.blockysize);
+    const size_t linear_index = y_block * rs.size_x + x_block;
+
+    return linear_index;
+}
+
+ArrayCoordinate linear_index_to_rowcol(const size_t linear_index, const RasterShape& rs) {
+    const ArrayIndex_t row = std::floor(static_cast<double>(linear_index) / static_cast<double>(rs.size_x));
+    const ArrayIndex_t col = linear_index - row*rs.size_x;
+
+    return std::make_pair(col, row);
+}
+
+std::vector<GeographicCoordinate> read_points_from_geofile(OGRLayer* layer) {
+    std::vector<GeographicCoordinate> points{};
     for (auto& feature : layer) {
         OGRGeometry* layer_geom = feature->GetGeometryRef();
         if (!layer_geom || !(wkbFlatten(layer_geom->getGeometryType()) == wkbPoint)) {
@@ -114,7 +140,7 @@ std::vector<std::pair<double, double>> read_points_from_geofile(OGRLayer* layer)
     return points;
 }
 
-CPLErr write_points_to_geofile(const std::string& path, const std::vector<std::pair<double, double>>& points, const std::vector<double>& values, const OGRSpatialReference* sref, const std::string output_driver = "FlatGeobuf", const std::string output_field_name = "sampled") {
+CPLErr write_points_to_geofile(const std::string& path, const std::vector<GeographicCoordinate>& points, const std::vector<double>& values, const OGRSpatialReference* sref, const std::string output_driver, const std::string output_field_name = "sampled") {
     GDALDriver* driver = GetGDALDriverManager()->GetDriverByName(output_driver.c_str());
     if (!driver) {
         std::cerr << "Could not use " << output_driver << " driver for writing\n";
@@ -161,18 +187,20 @@ CPLErr write_points_to_geofile(const std::string& path, const std::vector<std::p
 }
 
 void print_usage() {
-    std::cout << "Usage: parsam [-l,--layer layername] [-b,--band band_number] [-cs,--cachesize size] input_raster input_points output_points\n";
-    std::cout << "\t-l,--layer: name of input point layer to sample. Defaults to first layer\n";
-    std::cout << "\t-b,--band: band of input raster to sample. Defaults to first band\n";
-    std::cout << "\t-cs,--cachesize: Size in megabyte for GDAL to use internally for caching\n";
-    std::cout << "\tinput_raster: path pointing to input raster to sample points from\n";
-    std::cout << "\tinput_points: path pointing to input vector layer containing points to be sampled\n";
-    std::cout << "\toutput_points: path pointing to output vector layer containing sampled points\n";
-
-    return;
+    std::cout << "Usage: parsam [-l,--layer layername] [-b,--band band_number]\n";
+    std::cout << "              [-cs,--cachesize size] [-of,--output_format format]\n";
+    std::cout << "              input_raster input_points output_points\n\n";
+    std::cout << "       -l, --layer: name of input point layer to sample. Defaults to first layer\n";
+    std::cout << "       -b, --band: band of input raster to sample. Defaults to first band\n";
+    std::cout << "       -cs, --cachesize: Size in megabyte for GDAL to use internally for caching\n";
+    std::cout << "       -of, --output_format: Output format to use for result file. Needs to be a valid choice for GDAL tools\n\n";
+    std::cout << "       input_raster: path pointing to input raster to sample points from\n";
+    std::cout << "       input_points: path pointing to input vector layer containing points to be sampled\n";
+    std::cout << "       output_points: path pointing to output vector layer containing sampled points\n";
 }
 
 void parse_cli_args(const int argc, const char* argv[], Arguments& args) {
+    bool invalid_arg_found = false;
     size_t current_arg_idx = 1;
     size_t io_arg_idx = 0;
     std::array<std::string, 3> io_args{};
@@ -195,33 +223,47 @@ void parse_cli_args(const int argc, const char* argv[], Arguments& args) {
             current_arg_idx += 2;
             continue;
         }
+
+        if (current_arg.compare("-of") == 0 || current_arg.compare("--output_format") == 0) {
+            args.output_format = std::string{argv[current_arg_idx + 1]};
+            current_arg_idx += 2;
+            continue;
+        }
+
+        if (current_arg.compare(0, 1, "-") == 0 || current_arg.compare(0, 2, "--") == 0) {
+            std::cerr << "Unknown argument: " << current_arg << "\n";
+            invalid_arg_found = true;
+            break;
+        }
         
         io_args[io_arg_idx++] = current_arg;
         current_arg_idx++;
     }
 
-    args.input_raster = io_args[0];
-    args.input_points = io_args[1];
-    args.output_points = io_args[2];
-
-    return;
+    if (!invalid_arg_found) {
+        args.input_raster = io_args[0];
+        args.input_points = io_args[1];
+        args.output_points = io_args[2];
+    }
 }
 
 bool validate_parsed_arguments(const Arguments& args) {
     const bool raster_band_is_positive = args.raster_band > 0;
+    const bool cachesize_is_non_negative = args.cache_size >= 0;
     const bool input_points_are_present = !args.input_points.empty();
     const bool input_raster_is_present = !args.input_raster.empty();
     const bool output_points_are_present = !args.output_points.empty();
 
-    return raster_band_is_positive && 
-           input_points_are_present && 
-           input_raster_is_present && 
+    return raster_band_is_positive &&
+           cachesize_is_non_negative &&
+           input_points_are_present &&
+           input_raster_is_present &&
            output_points_are_present;
 }
 
 bool check_crs_match(const OGRSpatialReference* raster_sref, const OGRSpatialReference* point_sref) {
     if (!raster_sref || !point_sref) {
-        std::cerr << "Could not spatial reference from inputs\n";
+        std::cerr << "Could not read spatial reference from inputs\n";
         return false;
     }
     if (point_sref->IsSame(raster_sref) == 0) {
@@ -232,39 +274,40 @@ bool check_crs_match(const OGRSpatialReference* raster_sref, const OGRSpatialRef
     return true;
 }
 
-size_t rowcol_to_linear_index(const std::pair<size_t, size_t>& rowcol, const RasterShape& rs) {
-    const size_t x_block = std::floor(rowcol.first / rs.blockxsize);
-    const size_t y_block = std::floor(rowcol.second / rs.blockysize);
-    const size_t linear_index = y_block * rs.size_x + x_block;
-
-    return linear_index;
-}
-
-std::pair<size_t, size_t> linear_index_to_rowcol(const size_t linear_index, const RasterShape& rs) {
-    const size_t row = std::floor(static_cast<double>(linear_index) / static_cast<double>(rs.size_x));
-    const size_t col = linear_index - row*rs.size_x;
-
-    return std::make_pair(row, col);
-}
-
-void sort_proxy_by_blocks(std::vector<size_t>& point_proxy, const std::vector<std::pair<size_t, size_t>>& points_rowcol, const RasterShape& rs) {
+void sort_proxy_by_blocks(std::vector<size_t>& point_proxy, const std::vector<ArrayCoordinate>& points_rowcol, const RasterShape& rs) {
     std::sort(point_proxy.begin(), point_proxy.end(), [&](const auto& idx_a, const auto& idx_b) {
         const auto a = points_rowcol[idx_a];
-        // const size_t a_x_block = std::floor(a.first / rs.blockxsize);
-        // const size_t a_y_block = std::floor(a.second / rs.blockysize);
-        // const size_t a_linear_index = a_y_block * rs.size_x + a_x_block;
         const size_t a_linear_index = rowcol_to_linear_index(a, rs);
 
         const auto b = points_rowcol[idx_b];
-        // const size_t b_x_block = std::floor(b.first / rs.blockxsize);
-        // const size_t b_y_block = std::floor(b.second / rs.blockysize);
-        // const size_t b_linear_index = b_y_block * rs.size_x + b_x_block;
         const size_t b_linear_index = rowcol_to_linear_index(b, rs);
 
         // TODO: Add check for out-of-bounds points and always return larger than other point.
         //       This way, all out-of-bounds points should go to the end.
         return a_linear_index < b_linear_index;
     });
+}
+
+std::vector<std::pair<size_t, size_t>> calculate_nonempty_window_indices(const std::vector<size_t>& point_proxy, const std::vector<ArrayCoordinate>& points_rowcol, const RasterShape& rs) {
+    size_t starting_boundary_index = 0;
+    size_t starting_linear_index = rowcol_to_linear_index(points_rowcol[point_proxy[0]], rs);
+    std::vector<std::pair<size_t, size_t>> window_indices{};
+    
+    // This marks the initial window to sample from
+    window_indices.push_back(std::make_pair(starting_boundary_index, starting_linear_index));
+    
+    for (size_t i = 0; i < point_proxy.size(); i++) {
+        const size_t current_linear_index = rowcol_to_linear_index(points_rowcol[point_proxy[i]], rs);
+
+        if (starting_linear_index != current_linear_index) {
+            starting_boundary_index = i;
+            starting_linear_index = current_linear_index;
+
+            window_indices.push_back(std::make_pair(starting_boundary_index, starting_linear_index));
+        }
+    }
+
+    return window_indices;
 }
 
 RasterShape raster_shape_from_band(GDALRasterBand* band) {
@@ -281,44 +324,43 @@ RasterShape raster_shape_from_band(GDALRasterBand* band) {
     };
 }
 
-std::vector<double> sample_points_from_band(GDALRasterBand* band, const std::vector<std::pair<size_t, size_t>>& points_rowcol, const std::vector<size_t>& points_proxy, const RasterShape& rs) {
-    size_t current_point{0};
+std::vector<double> sample_points_from_band(GDALRasterBand* band, const std::vector<ArrayCoordinate>& points_rowcol, const std::vector<size_t>& points_proxy, const std::vector<std::pair<size_t, size_t>> window_indices, const RasterShape& rs) {
     const size_t max_point_index = points_rowcol.size();
     
     std::vector<double> points_sampled{};
     points_sampled.resize(points_rowcol.size());
     
-    std::vector<float> block_buffer{};
+    thread_local std::vector<float> block_buffer{};
     block_buffer.reserve(rs.blockxsize*rs.blockysize);
     
-    for (size_t block_y = 0; block_y < rs.num_blocks_y; block_y++) {
-        for (size_t block_x = 0; block_x < rs.num_blocks_x; block_x++) {
-            int valid_blocksize_x{}, valid_blocksize_y{};
-            band->GetActualBlockSize(block_x, block_y, &valid_blocksize_x, &valid_blocksize_y);
+    for (const auto [proxy_index, linear_index] : window_indices) {
+        size_t current_point = proxy_index;
+        const auto [block_x, block_y] = linear_index_to_rowcol(linear_index, rs);
+        int valid_blocksize_x{}, valid_blocksize_y{};
+        band->GetActualBlockSize(block_x, block_y, &valid_blocksize_x, &valid_blocksize_y);
 
-            if (band->ReadBlock(block_x, block_y, block_buffer.data()) != CE_None) {
-                throw std::runtime_error("Error reading block!");
+        if (band->ReadBlock(block_x, block_y, block_buffer.data()) != CE_None) {
+            throw std::runtime_error("Error reading block!");
+        }
+
+        // The left edge is always multiples of the full blocksize from the origin
+        // while the right edge may not be a full block size away due to partial blocks
+        const size_t block_xmin = block_x*rs.blockxsize, block_xmax = block_xmin + valid_blocksize_x;
+        const size_t block_ymin = block_y*rs.blockysize, block_ymax = block_ymin + valid_blocksize_y;
+        
+        while (true) {
+            const auto point_index = points_proxy[current_point];
+            const auto [glob_x, glob_y] = points_rowcol[point_index];
+            const bool within_x_bounds = block_xmin <= glob_x && glob_x < block_xmax;
+            const bool within_y_bounds = block_ymin <= glob_y && glob_y < block_ymax;
+
+            if (!within_x_bounds || !within_y_bounds || current_point == max_point_index - 1) {
+                break;
             }
 
-            // The left edge is always multiples of the full blocksize from the origin
-            // while the right edge may not be a full block size away due to partial blocks
-            const size_t block_xmin = block_x*rs.blockxsize, block_xmax = block_xmin + valid_blocksize_x;
-            const size_t block_ymin = block_y*rs.blockysize, block_ymax = block_ymin + valid_blocksize_y;
-            
-            while (true) {
-                const auto point_index = points_proxy[current_point];
-                const auto [glob_x, glob_y] = points_rowcol[point_index];
-                const bool within_x_bounds = block_xmin <= glob_x && glob_x < block_xmax;
-                const bool within_y_bounds = block_ymin <= glob_y && glob_y < block_ymax;
-
-                if (!within_x_bounds || !within_y_bounds || current_point == max_point_index - 1) {
-                    break;
-                }
-
-                const size_t local_x = glob_x - block_xmin, local_y = glob_y - block_ymin;
-                points_sampled[point_index] = block_buffer[local_y*rs.blockxsize + local_x];
-                current_point++;
-            }
+            const size_t local_x = glob_x - block_xmin, local_y = glob_y - block_ymin;
+            points_sampled[point_index] = block_buffer[local_y*rs.blockxsize + local_x];
+            current_point++;
         }
     }
 
@@ -341,7 +383,11 @@ int main(int argc, const char* argv[]) {
             std::cerr << "Cache size needs to be larger than or equal to zero\n";
         }
         else {
-            std::cerr << "Missing inputs detected. Please specify all of 'input_points', 'input_raster' and 'output_points'\n";
+            std::cerr << "Missing ";
+            if (args.input_points.empty()) std::cerr << "input points, ";
+            if (args.input_raster.empty()) std::cerr << "input raster, ";
+            if (args.output_points.empty()) std::cerr << "output points";
+            std::cerr << "\n";
         }
 
         print_usage();
@@ -394,7 +440,7 @@ int main(int argc, const char* argv[]) {
         return 1;
     }
 
-    RasterShape rs = raster_shape_from_band(band);
+    const RasterShape rs = raster_shape_from_band(band);
 
     const auto points = read_points_from_geofile(point_layer);
     const auto points_rowcol = projection_to_rowcol(gt_ir, points);
@@ -404,9 +450,11 @@ int main(int argc, const char* argv[]) {
     std::iota(points_proxy.begin(), points_proxy.end(), 0);
     sort_proxy_by_blocks(points_proxy, points_rowcol, rs);
 
-    const auto points_sampled = sample_points_from_band(band, points_rowcol, points_proxy, rs);
+    const auto window_indices = calculate_nonempty_window_indices(points_proxy, points_rowcol, rs);
 
-    CPLErr err = write_points_to_geofile(args.output_points, points, points_sampled, point_layer->GetSpatialRef());
+    const auto points_sampled = sample_points_from_band(band, points_rowcol, points_proxy, window_indices, rs);
+
+    CPLErr err = write_points_to_geofile(args.output_points, points, points_sampled, point_layer->GetSpatialRef(), args.output_format);
     if (err != CE_None) {
         std::cerr << "Error writing result\n";
         return 1;
