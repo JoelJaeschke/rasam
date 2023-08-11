@@ -1,6 +1,6 @@
-cmake_minimum_required(VERSION 3.15...3.25)
+cmake_minimum_required(VERSION 3.22)
 
-project(parsam
+project(rasam
   VERSION
     0.0.1
   DESCRIPTION
@@ -9,7 +9,9 @@ project(parsam
     CXX
 )
 
-SET(CMAKE_FIND_LIBRARY_SUFFIXES .a ${CMAKE_FIND_LIBRARY_SUFFIXES})
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(CMAKE_CXX_STANDARD 17)
+
 find_package(GDAL REQUIRED)
 
 add_subdirectory(${PROJECT_SOURCE_DIR}/src)

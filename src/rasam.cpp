@@ -1,7 +1,9 @@
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <iostream>
 #include <numeric>
+#include <ogr_srs_api.h>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -36,27 +38,35 @@ public:
     std::string input_points;
     std::string output_points;
     std::string output_format;
+    std::string source_srs;
+    std::string target_srs;
 
     Arguments(): raster_band(1),
                  cache_size(64),
-                 point_layer(""),
-                 input_raster(""),
-                 input_points(""),
-                 output_points(""),
-                 output_format("GPKG") {};
+                 point_layer(),
+                 input_raster(),
+                 input_points(),
+                 output_points(),
+                 output_format("GPKG"),
+                 source_srs(),
+                 target_srs() {};
     Arguments(const size_t raster_band,
               const size_t cache_size,
               const std::string point_layer,
               const std::string input_raster,
               const std::string input_points,
               const std::string output_points,
-              const std::string output_format): raster_band(raster_band),
-                                                cache_size(cache_size),
-                                                point_layer(point_layer),
-                                                input_raster(input_raster),
-                                                input_points(input_points),
-                                                output_points(output_points),
-                                                output_format(output_format) {};
+              const std::string output_format,
+              const std::string source_srs,
+              const std::string target_srs): raster_band(raster_band),
+                                             cache_size(cache_size),
+                                             point_layer(point_layer),
+                                             input_raster(input_raster),
+                                             input_points(input_points),
+                                             output_points(output_points),
+                                             output_format(output_format),
+                                             source_srs(source_srs),
+                                             target_srs(target_srs) {};
     ~Arguments() = default;
 };
 
@@ -124,23 +134,37 @@ ArrayCoordinate linear_index_to_rowcol(const size_t linear_index, const RasterSh
     return std::make_pair(col, row);
 }
 
-std::vector<GeographicCoordinate> read_points_from_geofile(OGRLayer* layer) {
+std::vector<GeographicCoordinate> read_points_from_geofile(OGRLayer* layer, OGRCoordinateTransformation* transform) {
+    OGRPoint* point = nullptr;
+    OGRGeometry* layer_geom = nullptr;
     std::vector<GeographicCoordinate> points{};
+    
+    const auto mapping_strategy = layer->GetSpatialRef()->GetDataAxisToSRSAxisMapping();
+    const bool invert_coordinate_order = !(mapping_strategy[0] == 2 && mapping_strategy[1] == 1);
     for (auto& feature : layer) {
-        OGRGeometry* layer_geom = feature->GetGeometryRef();
+        layer_geom = feature->GetGeometryRef();
         if (!layer_geom || !(wkbFlatten(layer_geom->getGeometryType()) == wkbPoint)) {
             std::cerr << "Detected feature with invalid/non-point geometry! Skipping...\n";
             continue;
         }
 
-        OGRPoint* point = layer_geom->toPoint();
-        points.push_back(std::make_pair((point->getX()), point->getY()));
+        point = layer_geom->toPoint();
+        if (transform && point->transform(transform) != OGRERR_NONE) {
+            std::cerr << "Failed to project point from point SRS to raster SRS!\n";
+            continue;
+        } 
+        double x = point->getX(), y = point->getY();
+        if (invert_coordinate_order) {
+            points.push_back(std::make_pair(y, x));
+        } else {
+            points.push_back(std::make_pair(x, y));
+        }
     }
 
     return points;
 }
 
-CPLErr write_points_to_geofile(const std::string& path, const std::vector<GeographicCoordinate>& points, const std::vector<double>& values, const OGRSpatialReference* sref, const std::string output_driver, const std::string output_field_name = "sampled") {
+CPLErr write_points_to_geofile(const std::string& path, const std::vector<GeographicCoordinate>& points, const std::vector<double>& values, const OGRSpatialReference* sref, OGRCoordinateTransformation* transform, const std::string output_driver, const std::string output_field_name = "sampled") {
     GDALDriver* driver = GetGDALDriverManager()->GetDriverByName(output_driver.c_str());
     if (!driver) {
         std::cerr << "Could not use " << output_driver << " driver for writing\n";
@@ -167,11 +191,22 @@ CPLErr write_points_to_geofile(const std::string& path, const std::vector<Geogra
         return CE_Failure;
     }
 
+    const auto mapping_strategy = transform->GetTargetCS()->GetDataAxisToSRSAxisMapping();
+    const bool invert_coordinate_order = !(mapping_strategy[0] == 2 && mapping_strategy[1] == 1);
     for (size_t i = 0; i < points.size(); i++) {
         OGRFeature* feature = OGRFeature::CreateFeature(layer->GetLayerDefn());
         feature->SetField(output_field_name.c_str(), values[i]);
-        
-        OGRPoint pt(points[i].first, points[i].second);
+
+        OGRPoint pt{};
+        if (invert_coordinate_order) {
+            pt.setX(points[i].second); pt.setY(points[i].first);
+        } else {
+            pt.setX(points[i].first); pt.setY(points[i].second);
+        }
+
+        if (transform && pt.transform(transform) != OGRERR_NONE) {
+            std::cerr << "Failed to project point from source SRS to specified target SRS!\n";
+        };
         feature->SetGeometry(&pt);
 
         if (layer->CreateFeature(feature) != OGRERR_NONE) {
@@ -189,14 +224,20 @@ CPLErr write_points_to_geofile(const std::string& path, const std::vector<Geogra
 void print_usage() {
     std::cout << "Usage: parsam [-l,--layer layername] [-b,--band band_number]\n";
     std::cout << "              [-cs,--cachesize size] [-of,--output_format format]\n";
+    std::cout << "              [-s_srs,--source_srs srs] [-t_srs,--target_srs srs]\n";
     std::cout << "              input_raster input_points output_points\n\n";
-    std::cout << "       -l, --layer: name of input point layer to sample. Defaults to first layer\n";
-    std::cout << "       -b, --band: band of input raster to sample. Defaults to first band\n";
-    std::cout << "       -cs, --cachesize: Size in megabyte for GDAL to use internally for caching\n";
-    std::cout << "       -of, --output_format: Output format to use for result file. Needs to be a valid choice for GDAL tools\n\n";
-    std::cout << "       input_raster: path pointing to input raster to sample points from\n";
-    std::cout << "       input_points: path pointing to input vector layer containing points to be sampled\n";
-    std::cout << "       output_points: path pointing to output vector layer containing sampled points\n";
+    std::cout << "       -l, --layer: Name of input point layer to sample. Defaults to first layer.\n";
+    std::cout << "       -b, --band: Band of input raster to sample. Defaults to first band.\n";
+    std::cout << "       -cs, --cachesize: Size in megabyte for GDAL to use internally for caching.\n";
+    std::cout << "       -of, --output_format: Output format to use for result file. Needs to be a valid choice for GDAL tools.\n";
+    std::cout << "       -s_srs,--source_srs: Source spatial reference system to use for inputs. Note that input points will be\n"
+              << "                            dynamically reprojected if necessary, but an error will be thrown if the raster\n"
+              << "                            is not using this reference system.\n";
+    std::cout << "       -t_srs,--target_srs: Target spatial reference system to project output points into.\n";
+    std::cout << "\n";
+    std::cout << "       input_raster: Path pointing to input raster to sample points from.\n";
+    std::cout << "       input_points: Path pointing to input vector layer containing points to be sampled.\n";
+    std::cout << "       output_points: Path pointing to output vector layer containing sampled points.\n";
 }
 
 void parse_cli_args(const int argc, const char* argv[], Arguments& args) {
@@ -204,7 +245,7 @@ void parse_cli_args(const int argc, const char* argv[], Arguments& args) {
     size_t current_arg_idx = 1;
     size_t io_arg_idx = 0;
     std::array<std::string, 3> io_args{};
-    while (current_arg_idx < argc) {
+    while (current_arg_idx < static_cast<size_t>(argc)) {
         const std::string current_arg{argv[current_arg_idx]};
         if (current_arg.compare("-l") == 0 || current_arg.compare("--layer") == 0) {
             args.point_layer = std::string{argv[current_arg_idx + 1]};
@@ -219,13 +260,32 @@ void parse_cli_args(const int argc, const char* argv[], Arguments& args) {
         }
 
         if (current_arg.compare("-cs") == 0 || current_arg.compare("--cachesize") == 0) {
-            args.cache_size = std::stoi(argv[current_arg_idx + 1]);
+            const int cache_size = std::stoi(argv[current_arg_idx + 1]);
+            if (cache_size < 0) {
+                std::cerr << "Negative cachesize is not allowed!\n";
+                invalid_arg_found = true;
+                break;
+            }
+
+            args.cache_size = cache_size;
             current_arg_idx += 2;
             continue;
         }
 
         if (current_arg.compare("-of") == 0 || current_arg.compare("--output_format") == 0) {
             args.output_format = std::string{argv[current_arg_idx + 1]};
+            current_arg_idx += 2;
+            continue;
+        }
+
+        if (current_arg.compare("-s_srs") == 0 || current_arg.compare("--source_srs") == 0) {
+            args.source_srs = std::string{argv[current_arg_idx + 1]};
+            current_arg_idx += 2;
+            continue;
+        }
+
+        if (current_arg.compare("-t_srs") == 0 || current_arg.compare("--target_srs") == 0) {
+            args.target_srs = std::string{argv[current_arg_idx + 1]};
             current_arg_idx += 2;
             continue;
         }
@@ -249,13 +309,11 @@ void parse_cli_args(const int argc, const char* argv[], Arguments& args) {
 
 bool validate_parsed_arguments(const Arguments& args) {
     const bool raster_band_is_positive = args.raster_band > 0;
-    const bool cachesize_is_non_negative = args.cache_size >= 0;
     const bool input_points_are_present = !args.input_points.empty();
     const bool input_raster_is_present = !args.input_raster.empty();
     const bool output_points_are_present = !args.output_points.empty();
 
     return raster_band_is_positive &&
-           cachesize_is_non_negative &&
            input_points_are_present &&
            input_raster_is_present &&
            output_points_are_present;
@@ -266,12 +324,57 @@ bool check_crs_match(const OGRSpatialReference* raster_sref, const OGRSpatialRef
         std::cerr << "Could not read spatial reference from inputs\n";
         return false;
     }
-    if (point_sref->IsSame(raster_sref) == 0) {
+    if (!point_sref->IsSame(raster_sref)) {
         std::cerr << "Spatial reference systems of inputs do not match\n";
         return false;
     }
 
     return true;
+}
+
+OGRErr determine_source_srs(const Arguments& args, OGRSpatialReference*& source_sref, const OGRSpatialReference* raster_sref, const OGRSpatialReference* point_sref) {
+    if (!args.source_srs.empty()) {
+        OGRSpatialReference user_input_srs;
+        if (user_input_srs.SetFromUserInput(args.source_srs.c_str()) != OGRERR_NONE) {
+            std::cerr << "Did not understand source spatial reference definition!\n";
+            return OGRERR_UNSUPPORTED_SRS;
+        };
+
+        // TODO: This only checks whether they use the same geographical CRS and both are projected/non-projected. However,
+        //       the projections may still be different!
+        if (!(raster_sref->IsSameGeogCS(&user_input_srs) && raster_sref->IsProjected() == user_input_srs.IsProjected())) {
+            std::cerr << "SRS mismatch between input raster and source raster definition. Are they using the same CRS?\n";
+            return OGRERR_UNSUPPORTED_SRS;
+        }
+
+        source_sref = user_input_srs.Clone();
+    } else {
+        if (!check_crs_match(raster_sref, point_sref)) {
+            std::cerr << "Mismatch between input raster and input point SRS! Either specify a custom one using '-s_srs' to reproject points\n"
+                        << "on the fly to the raster SRS or reproject both to the same SRS before.\n";
+            return OGRERR_UNSUPPORTED_SRS;
+        }
+
+        source_sref = raster_sref->Clone();
+    }
+
+    return OGRERR_NONE;
+}
+
+OGRErr determine_target_srs(const Arguments& args, OGRSpatialReference*& target_sref, const OGRSpatialReference* source_sref) {
+    if (!args.target_srs.empty()) {
+        OGRSpatialReference user_target_srs;
+        if (user_target_srs.SetFromUserInput(args.target_srs.c_str()) != OGRERR_NONE) {
+            std::cerr << "Did not understand target spatial reference definition!\n";
+            return OGRERR_UNSUPPORTED_SRS;
+        }
+
+        target_sref = user_target_srs.Clone();
+    } else {
+        target_sref = source_sref->Clone();
+    }
+
+    return OGRERR_NONE;
 }
 
 void sort_proxy_by_blocks(std::vector<size_t>& point_proxy, const std::vector<ArrayCoordinate>& points_rowcol, const RasterShape& rs) {
@@ -333,7 +436,7 @@ std::vector<double> sample_points_from_band(GDALRasterBand* band, const std::vec
     thread_local std::vector<float> block_buffer{};
     block_buffer.reserve(rs.blockxsize*rs.blockysize);
     
-    for (const auto [proxy_index, linear_index] : window_indices) {
+    for (const auto& [proxy_index, linear_index] : window_indices) {
         size_t current_point = proxy_index;
         const auto [block_x, block_y] = linear_index_to_rowcol(linear_index, rs);
         int valid_blocksize_x{}, valid_blocksize_y{};
@@ -378,11 +481,7 @@ int main(int argc, const char* argv[]) {
     if (!validate_parsed_arguments(args)) {
         if (args.raster_band < 1) {
             std::cerr << "Raster band needs to be larger than or equal to 1\n";
-        } 
-        else if (args.cache_size < 0) {
-            std::cerr << "Cache size needs to be larger than or equal to zero\n";
-        }
-        else {
+        } else {
             std::cerr << "Missing ";
             if (args.input_points.empty()) std::cerr << "input points, ";
             if (args.input_raster.empty()) std::cerr << "input raster, ";
@@ -399,8 +498,7 @@ int main(int argc, const char* argv[]) {
     // Limit GDAL's internal caching size. At 64MB, there does not seem to be much benefit from more
     CPLSetConfigOption("GDAL_CACHEMAX", std::to_string(args.cache_size).c_str());
 
-    const GDALAccess eAccess = GA_ReadOnly;
-    GDALDatasetUniquePtr input_raster = GDALDatasetUniquePtr(GDALDataset::FromHandle(GDALOpen(args.input_raster.c_str(), eAccess)));
+    GDALDatasetUniquePtr input_raster = GDALDatasetUniquePtr(GDALDataset::FromHandle(GDALOpen(args.input_raster.c_str(), GA_ReadOnly)));
     if(!input_raster) {
         std::cerr << "Could not open input raster at " << args.input_raster << "\n";
         return 1;
@@ -424,7 +522,7 @@ int main(int argc, const char* argv[]) {
         return 1;
     }
 
-    OGRLayer* point_layer{};
+    OGRLayer* point_layer = nullptr;
     if (!args.point_layer.empty()) {
         point_layer = input_points->GetLayerByName(args.point_layer.c_str());
     } else {
@@ -436,13 +534,47 @@ int main(int argc, const char* argv[]) {
         return 1;
     }
 
-    if (!check_crs_match(input_raster->GetSpatialRef(), point_layer->GetSpatialRef())) {
+    // If the user supplied custom source and target spatial reference systems,
+    // check them early so we can fail early if something mismatches
+    const OGRSpatialReference* raster_sref = input_raster->GetSpatialRef();
+    const OGRSpatialReference* point_sref = point_layer->GetSpatialRef();
+
+    OGRSpatialReference* source_srs = nullptr;
+    if (determine_source_srs(args, source_srs, raster_sref, point_sref) != OGRERR_NONE) {
         return 1;
+    }
+
+    OGRSpatialReference* target_srs = nullptr;
+    if (determine_target_srs(args, target_srs, source_srs) != OGRERR_NONE) {
+        return 1;
+    }
+
+    // Transform input points during reading if they are using a different CRS. Just pass
+    // a matching transform to the read_points_from_geofile function
+    OGRCoordinateTransformation* source_point_transform = nullptr;
+    if (!point_sref->IsSame(source_srs)) {
+        source_point_transform = OGRCreateCoordinateTransformation(point_sref, source_srs);
+
+        if (!source_point_transform) {
+            std::cerr << "Failed to find a transform for going from point SRS to specified source SRS!\n";
+            return 1;
+        }
+    }
+
+    // Same applies for output SRS. Figure out early if we can even do this!
+    OGRCoordinateTransformation *target_point_transform = nullptr;
+    if (!source_srs->IsSame(target_srs)) {
+        target_point_transform = OGRCreateCoordinateTransformation(source_srs, target_srs);
+
+        if (!target_point_transform) {
+            std::cerr << "Failed to find a transform for going from raster SRS to specified target SRS!\n";
+            return 1;
+        }
     }
 
     const RasterShape rs = raster_shape_from_band(band);
 
-    const auto points = read_points_from_geofile(point_layer);
+    const auto points = read_points_from_geofile(point_layer, source_point_transform);
     const auto points_rowcol = projection_to_rowcol(gt_ir, points);
 
     std::vector<size_t> points_proxy{};
@@ -454,8 +586,7 @@ int main(int argc, const char* argv[]) {
 
     const auto points_sampled = sample_points_from_band(band, points_rowcol, points_proxy, window_indices, rs);
 
-    CPLErr err = write_points_to_geofile(args.output_points, points, points_sampled, point_layer->GetSpatialRef(), args.output_format);
-    if (err != CE_None) {
+    if (write_points_to_geofile(args.output_points, points, points_sampled, target_srs, target_point_transform, args.output_format) != CE_None) {
         std::cerr << "Error writing result\n";
         return 1;
     }
