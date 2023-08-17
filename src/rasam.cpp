@@ -101,24 +101,6 @@ std::vector<ArrayCoordinate> projection_to_rowcol(const GeoTransform& gt, const 
     return output;
 }
 
-GeographicCoordinate rowcol_to_projection(const GeoTransform& gt, const ArrayCoordinate& point) {
-    return std::make_pair(
-        gt[1] * point.first + gt[2] * point.second + gt[1] * 0.5 + gt[2] * 0.5 + gt[0],
-        gt[4] * point.first + gt[5] * point.second + gt[4] * 0.5 + gt[5] * 0.5 + gt[3]
-    );
-}
-
-std::vector<GeographicCoordinate> rowcol_to_projection(const GeoTransform& gt, const std::vector<ArrayCoordinate>& points) {
-    std::vector<GeographicCoordinate> output{};
-    output.reserve(points.size());
-    
-    std::transform(points.begin(), points.end(), std::back_inserter(output), [&gt](const auto& elem) {
-        return rowcol_to_projection(gt, elem);
-    });
-
-    return output;
-}
-
 size_t rowcol_to_linear_index(const ArrayCoordinate& rowcol, const RasterShape& rs) {
     const size_t x_block = std::floor(rowcol.first / rs.blockxsize);
     const size_t y_block = std::floor(rowcol.second / rs.blockysize);
@@ -138,9 +120,7 @@ std::vector<GeographicCoordinate> read_points_from_geofile(OGRLayer* layer, OGRC
     OGRPoint* point = nullptr;
     OGRGeometry* layer_geom = nullptr;
     std::vector<GeographicCoordinate> points{};
-    
-    const auto mapping_strategy = layer->GetSpatialRef()->GetDataAxisToSRSAxisMapping();
-    const bool invert_coordinate_order = !(mapping_strategy[0] == 2 && mapping_strategy[1] == 1);
+
     for (auto& feature : layer) {
         layer_geom = feature->GetGeometryRef();
         if (!layer_geom || !(wkbFlatten(layer_geom->getGeometryType()) == wkbPoint)) {
@@ -152,19 +132,20 @@ std::vector<GeographicCoordinate> read_points_from_geofile(OGRLayer* layer, OGRC
         if (transform && point->transform(transform) != OGRERR_NONE) {
             std::cerr << "Failed to project point from point SRS to raster SRS!\n";
             continue;
-        } 
-        double x = point->getX(), y = point->getY();
-        if (invert_coordinate_order) {
-            points.push_back(std::make_pair(y, x));
-        } else {
-            points.push_back(std::make_pair(x, y));
         }
+        points.push_back(std::make_pair(point->getX(), point->getY()));
     }
 
     return points;
 }
 
-CPLErr write_points_to_geofile(const std::string& path, const std::vector<GeographicCoordinate>& points, const std::vector<double>& values, const OGRSpatialReference* sref, OGRCoordinateTransformation* transform, const std::string output_driver, const std::string output_field_name = "sampled") {
+CPLErr write_points_to_geofile(const std::string& path, 
+                               const std::vector<GeographicCoordinate>& points,
+                               const std::vector<double>& values,
+                               const OGRSpatialReference* sref,
+                               OGRCoordinateTransformation* transform,
+                               const std::string output_driver,
+                               const std::string output_field_name = "sampled") {
     GDALDriver* driver = GetGDALDriverManager()->GetDriverByName(output_driver.c_str());
     if (!driver) {
         std::cerr << "Could not use " << output_driver << " driver for writing\n";
@@ -177,33 +158,31 @@ CPLErr write_points_to_geofile(const std::string& path, const std::vector<Geogra
         return CE_Failure;
     }
 
+    CPLStringList options{};
+    if (output_driver.compare("CSV") == 0) {
+        options.SetNameValue("GEOMETRY", "AS_XY");
+    }
+
     OGRSpatialReference* sref_output = sref->Clone();
-    OGRLayer* layer = ds->CreateLayer("output", sref_output, wkbPoint, NULL);
+    OGRLayer* layer = ds->CreateLayer("output", sref_output, wkbPoint, options);
     if (!layer) {
         std::cerr << "Could not create layer using " << output_driver << " driver\n";
         return CE_Failure;
     }
 
     OGRFieldDefn field(output_field_name.c_str(), OFTReal);
-    field.SetWidth(10);
+    field.SetWidth(32);
+    field.SetPrecision(15);
     if (layer->CreateField(&field) != OGRERR_NONE) {
         std::cerr << "Could not create field on output\n";
         return CE_Failure;
     }
 
-    const auto mapping_strategy = transform->GetTargetCS()->GetDataAxisToSRSAxisMapping();
-    const bool invert_coordinate_order = !(mapping_strategy[0] == 2 && mapping_strategy[1] == 1);
     for (size_t i = 0; i < points.size(); i++) {
         OGRFeature* feature = OGRFeature::CreateFeature(layer->GetLayerDefn());
         feature->SetField(output_field_name.c_str(), values[i]);
 
-        OGRPoint pt{};
-        if (invert_coordinate_order) {
-            pt.setX(points[i].second); pt.setY(points[i].first);
-        } else {
-            pt.setX(points[i].first); pt.setY(points[i].second);
-        }
-
+        OGRPoint pt{points[i].first, points[i].second};
         if (transform && pt.transform(transform) != OGRERR_NONE) {
             std::cerr << "Failed to project point from source SRS to specified target SRS!\n";
         };
@@ -358,6 +337,7 @@ OGRErr determine_source_srs(const Arguments& args, OGRSpatialReference*& source_
         source_sref = raster_sref->Clone();
     }
 
+    source_sref->SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
     return OGRERR_NONE;
 }
 
@@ -374,6 +354,7 @@ OGRErr determine_target_srs(const Arguments& args, OGRSpatialReference*& target_
         target_sref = source_sref->Clone();
     }
 
+    target_sref->SetAxisMappingStrategy(OAMS_TRADITIONAL_GIS_ORDER);
     return OGRERR_NONE;
 }
 
@@ -416,7 +397,7 @@ std::vector<std::pair<size_t, size_t>> calculate_nonempty_window_indices(const s
 RasterShape raster_shape_from_band(GDALRasterBand* band) {
     int blockxsize, blockysize;
     band->GetBlockSize(&blockxsize, &blockysize);
-    
+
     return RasterShape {
         static_cast<size_t>(blockxsize),
         static_cast<size_t>(blockysize),
@@ -539,21 +520,21 @@ int main(int argc, const char* argv[]) {
     const OGRSpatialReference* raster_sref = input_raster->GetSpatialRef();
     const OGRSpatialReference* point_sref = point_layer->GetSpatialRef();
 
-    OGRSpatialReference* source_srs = nullptr;
-    if (determine_source_srs(args, source_srs, raster_sref, point_sref) != OGRERR_NONE) {
+    OGRSpatialReference* source_sref = nullptr;
+    if (determine_source_srs(args, source_sref, raster_sref, point_sref) != OGRERR_NONE) {
         return 1;
     }
 
-    OGRSpatialReference* target_srs = nullptr;
-    if (determine_target_srs(args, target_srs, source_srs) != OGRERR_NONE) {
+    OGRSpatialReference* target_sref = nullptr;
+    if (determine_target_srs(args, target_sref, source_sref) != OGRERR_NONE) {
         return 1;
     }
 
     // Transform input points during reading if they are using a different CRS. Just pass
     // a matching transform to the read_points_from_geofile function
     OGRCoordinateTransformation* source_point_transform = nullptr;
-    if (!point_sref->IsSame(source_srs)) {
-        source_point_transform = OGRCreateCoordinateTransformation(point_sref, source_srs);
+    if (!point_sref->IsSame(source_sref)) {
+        source_point_transform = OGRCreateCoordinateTransformation(point_sref, source_sref);
 
         if (!source_point_transform) {
             std::cerr << "Failed to find a transform for going from point SRS to specified source SRS!\n";
@@ -563,8 +544,8 @@ int main(int argc, const char* argv[]) {
 
     // Same applies for output SRS. Figure out early if we can even do this!
     OGRCoordinateTransformation *target_point_transform = nullptr;
-    if (!source_srs->IsSame(target_srs)) {
-        target_point_transform = OGRCreateCoordinateTransformation(source_srs, target_srs);
+    if (!source_sref->IsSame(target_sref)) {
+        target_point_transform = OGRCreateCoordinateTransformation(source_sref, target_sref);
 
         if (!target_point_transform) {
             std::cerr << "Failed to find a transform for going from raster SRS to specified target SRS!\n";
@@ -586,7 +567,7 @@ int main(int argc, const char* argv[]) {
 
     const auto points_sampled = sample_points_from_band(band, points_rowcol, points_proxy, window_indices, rs);
 
-    if (write_points_to_geofile(args.output_points, points, points_sampled, target_srs, target_point_transform, args.output_format) != CE_None) {
+    if (write_points_to_geofile(args.output_points, points, points_sampled, target_sref, target_point_transform, args.output_format) != CE_None) {
         std::cerr << "Error writing result\n";
         return 1;
     }
