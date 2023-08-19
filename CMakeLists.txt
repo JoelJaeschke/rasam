@@ -4,7 +4,7 @@ project(rasam
   VERSION
     0.0.1
   DESCRIPTION
-    "Parallel raster sampling using GDAL"
+    "Raster sampling tool using GDAL"
   LANGUAGES
     CXX
 )
