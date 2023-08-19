@@ -25,8 +25,9 @@ using ArrayIndex_t = uint32_t;
 using Row = ArrayIndex_t;
 using Column = ArrayIndex_t;
 using ArrayCoordinate = std::pair<Column, Row>;
-using Latitude = double;
-using Longitude = double;
+using GeographicIndex_t = double;
+using Latitude = GeographicIndex_t;
+using Longitude = GeographicIndex_t;
 using GeographicCoordinate = std::pair<Longitude, Latitude>;
 
 struct Arguments {
@@ -172,7 +173,8 @@ CPLErr write_points_to_geofile(const std::string& path,
 
     OGRFieldDefn field(output_field_name.c_str(), OFTReal);
     field.SetWidth(32);
-    field.SetPrecision(15);
+    field.SetPrecision(13);
+
     if (layer->CreateField(&field) != OGRERR_NONE) {
         std::cerr << "Could not create field on output\n";
         return CE_Failure;
@@ -438,7 +440,7 @@ std::vector<double> sample_points_from_band(GDALRasterBand* band, const std::vec
             const bool within_x_bounds = block_xmin <= glob_x && glob_x < block_xmax;
             const bool within_y_bounds = block_ymin <= glob_y && glob_y < block_ymax;
 
-            if (!within_x_bounds || !within_y_bounds || current_point == max_point_index - 1) {
+            if (!within_x_bounds || !within_y_bounds || current_point == max_point_index) {
                 break;
             }
 
