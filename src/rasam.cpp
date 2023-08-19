@@ -2,6 +2,7 @@
 #include <array>
 #include <cstddef>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <ogr_srs_api.h>
 #include <stdexcept>
@@ -82,6 +83,23 @@ public:
 
     RasterShape() = default;
     ~RasterShape() = default;
+};
+
+struct RasterBounds {
+private:
+    double ulx;
+    double uly;
+    double lrx;
+    double lry;
+public:
+    RasterBounds(const GeoTransform& gt, const size_t rastersize_x, const size_t rastersize_y) {
+        ulx = gt[0]; uly = gt[3] + rastersize_y*gt[5]; lrx = gt[0] + rastersize_x*gt[1]; lry = gt[3];
+    };
+    ~RasterBounds() = default;
+
+    std::array<GeographicIndex_t, 4> to_array() const {
+        return {ulx, uly, lrx, lry};
+    };
 };
 
 ArrayCoordinate projection_to_rowcol(const GeoTransform& gt, const GeographicCoordinate& point) {
@@ -360,21 +378,39 @@ OGRErr determine_target_srs(const Arguments& args, OGRSpatialReference*& target_
     return OGRERR_NONE;
 }
 
-void sort_proxy_by_blocks(std::vector<size_t>& point_proxy, const std::vector<ArrayCoordinate>& points_rowcol, const RasterShape& rs) {
+std::vector<bool> calculate_points_in_bounds_mask(const std::vector<GeographicCoordinate>& points, const RasterBounds& rb) {
+    std::vector<bool> in_bounds{};
+    in_bounds.reserve(points.size());
+
+    const auto raster_bounds = rb.to_array();
+
+    std::transform(points.begin(), points.end(), std::back_inserter(in_bounds), [&raster_bounds](const auto& point) {
+        const bool in_x_bounds = point.first > raster_bounds[0] && point.first < raster_bounds[2];
+        const bool in_y_bounds = point.second > raster_bounds[1] && point.second < raster_bounds[3];
+        return in_x_bounds && in_y_bounds;
+    });
+
+    return in_bounds;
+}
+
+void sort_proxy_by_blocks(std::vector<size_t>& point_proxy, const std::vector<ArrayCoordinate>& points_rowcol, const std::vector<bool>& valid_mask, const RasterShape& rs) {
     std::sort(point_proxy.begin(), point_proxy.end(), [&](const auto& idx_a, const auto& idx_b) {
         const auto a = points_rowcol[idx_a];
-        const size_t a_linear_index = rowcol_to_linear_index(a, rs);
+        const size_t a_linear_index = valid_mask[idx_a] ? rowcol_to_linear_index(a, rs) : std::numeric_limits<size_t>::max();
 
         const auto b = points_rowcol[idx_b];
-        const size_t b_linear_index = rowcol_to_linear_index(b, rs);
+        const size_t b_linear_index = valid_mask[idx_b] ? rowcol_to_linear_index(b, rs) : std::numeric_limits<size_t>::max();
 
-        // TODO: Add check for out-of-bounds points and always return larger than other point.
-        //       This way, all out-of-bounds points should go to the end.
         return a_linear_index < b_linear_index;
     });
 }
 
-std::vector<std::pair<size_t, size_t>> calculate_nonempty_window_indices(const std::vector<size_t>& point_proxy, const std::vector<ArrayCoordinate>& points_rowcol, const RasterShape& rs) {
+std::vector<std::pair<size_t, size_t>> calculate_nonempty_window_indices(
+    const std::vector<size_t>& point_proxy,
+    const std::vector<ArrayCoordinate>& points_rowcol,
+    const std::vector<bool>& valid_mask,
+    const RasterShape& rs
+) {
     size_t starting_boundary_index = 0;
     size_t starting_linear_index = rowcol_to_linear_index(points_rowcol[point_proxy[0]], rs);
     std::vector<std::pair<size_t, size_t>> window_indices{};
@@ -389,7 +425,13 @@ std::vector<std::pair<size_t, size_t>> calculate_nonempty_window_indices(const s
             starting_boundary_index = i;
             starting_linear_index = current_linear_index;
 
-            window_indices.push_back(std::make_pair(starting_boundary_index, starting_linear_index));
+            if (valid_mask[point_proxy[i]]) {
+                window_indices.push_back(std::make_pair(starting_boundary_index, starting_linear_index));
+            } else {
+                // Push a window with a special value for the linear index. This will be used to abort once all valid points are covered.
+                window_indices.push_back(std::make_pair(starting_boundary_index, std::numeric_limits<size_t>::max()));
+                break;
+            }
         }
     }
 
@@ -413,13 +455,16 @@ RasterShape raster_shape_from_band(GDALRasterBand* band) {
 std::vector<double> sample_points_from_band(GDALRasterBand* band, const std::vector<ArrayCoordinate>& points_rowcol, const std::vector<size_t>& points_proxy, const std::vector<std::pair<size_t, size_t>> window_indices, const RasterShape& rs) {
     const size_t max_point_index = points_rowcol.size();
     
-    std::vector<double> points_sampled{};
-    points_sampled.resize(points_rowcol.size());
+    std::vector<double> points_sampled(points_rowcol.size(), std::numeric_limits<double>::quiet_NaN());
     
-    thread_local std::vector<float> block_buffer{};
+    std::vector<float> block_buffer{};
     block_buffer.reserve(rs.blockxsize*rs.blockysize);
-    
+
     for (const auto& [proxy_index, linear_index] : window_indices) {
+        if (linear_index == std::numeric_limits<size_t>::max()) {
+            break;
+        }
+
         size_t current_point = proxy_index;
         const auto [block_x, block_y] = linear_index_to_rowcol(linear_index, rs);
         int valid_blocksize_x{}, valid_blocksize_y{};
@@ -556,16 +601,17 @@ int main(int argc, const char* argv[]) {
     }
 
     const RasterShape rs = raster_shape_from_band(band);
+    const RasterBounds rb(gt_ir, input_raster->GetRasterXSize(), input_raster->GetRasterYSize());
 
     const auto points = read_points_from_geofile(point_layer, source_point_transform);
+    const auto in_bounds = calculate_points_in_bounds_mask(points, rb);
     const auto points_rowcol = projection_to_rowcol(gt_ir, points);
 
-    std::vector<size_t> points_proxy{};
-    points_proxy.resize(points_rowcol.size());
+    std::vector<size_t> points_proxy(points_rowcol.size());
     std::iota(points_proxy.begin(), points_proxy.end(), 0);
-    sort_proxy_by_blocks(points_proxy, points_rowcol, rs);
+    sort_proxy_by_blocks(points_proxy, points_rowcol, in_bounds, rs);
 
-    const auto window_indices = calculate_nonempty_window_indices(points_proxy, points_rowcol, rs);
+    const auto window_indices = calculate_nonempty_window_indices(points_proxy, points_rowcol, in_bounds, rs);
 
     const auto points_sampled = sample_points_from_band(band, points_rowcol, points_proxy, window_indices, rs);
 
