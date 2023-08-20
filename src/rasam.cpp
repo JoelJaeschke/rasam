@@ -1,12 +1,13 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <iostream>
 #include <limits>
 #include <numeric>
-#include <ogr_srs_api.h>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -17,6 +18,7 @@
 #include "ogr_feature.h"
 #include "ogr_geometry.h"
 #include "ogr_core.h"
+#include "ogr_srs_api.h"
 #include "ogr_spatialref.h"
 #include "cpl_port.h"
 #include "cpl_string.h"
@@ -158,9 +160,19 @@ std::vector<GeographicCoordinate> read_points_from_geofile(OGRLayer* layer, OGRC
     return points;
 }
 
+OGRFieldType ogr_type_from_gdal_type(const GDALDataType dt) {
+    if (dt == GDT_Float32 || dt == GDT_Float64) { return OFTReal; }
+    if (dt == GDT_Int8 || dt == GDT_Int16 || dt == GDT_Int32 || dt == GDT_Int64 || 
+        dt == GDT_UInt16 || dt == GDT_UInt32 || dt == GDT_UInt64) { return OFTInteger64; }
+    
+    return OFTMaxType;
+}
+
+template<typename T>
 CPLErr write_points_to_geofile(const std::string& path, 
                                const std::vector<GeographicCoordinate>& points,
-                               const std::vector<double>& values,
+                               const std::vector<T>& values,
+                               const GDALDataType raster_dt,
                                const OGRSpatialReference* sref,
                                OGRCoordinateTransformation* transform,
                                const std::string output_driver,
@@ -189,7 +201,13 @@ CPLErr write_points_to_geofile(const std::string& path,
         return CE_Failure;
     }
 
-    OGRFieldDefn field(output_field_name.c_str(), OFTReal);
+    const OGRFieldType field_type = ogr_type_from_gdal_type(raster_dt);
+    if (field_type == OFTMaxType) {
+        std::cerr << "Could not determine field type!\n";
+        return CE_Failure;
+    }
+
+    OGRFieldDefn field(output_field_name.c_str(), field_type);
     field.SetWidth(32);
     field.SetPrecision(13);
 
@@ -200,7 +218,11 @@ CPLErr write_points_to_geofile(const std::string& path,
 
     for (size_t i = 0; i < points.size(); i++) {
         OGRFeature* feature = OGRFeature::CreateFeature(layer->GetLayerDefn());
-        feature->SetField(output_field_name.c_str(), values[i]);
+        if constexpr (std::is_floating_point_v<T>) {
+            feature->SetField(output_field_name.c_str(), static_cast<double>(values[i]));
+        } else {
+            feature->SetField(output_field_name.c_str(), static_cast<int>(values[i]));
+        }
 
         OGRPoint pt{points[i].first, points[i].second};
         if (transform && pt.transform(transform) != OGRERR_NONE) {
@@ -452,12 +474,25 @@ RasterShape raster_shape_from_band(GDALRasterBand* band) {
     };
 }
 
-std::vector<double> sample_points_from_band(GDALRasterBand* band, const std::vector<ArrayCoordinate>& points_rowcol, const std::vector<size_t>& points_proxy, const std::vector<std::pair<size_t, size_t>> window_indices, const RasterShape& rs) {
+template<typename T>
+std::vector<T> sample_points_from_band(GDALRasterBand* band,
+                                       const std::vector<ArrayCoordinate>& points_rowcol,
+                                       const std::vector<size_t>& points_proxy,
+                                       const std::vector<std::pair<size_t, size_t>>& window_indices,
+                                       const RasterShape& rs)
+{
     const size_t max_point_index = points_rowcol.size();
     
-    std::vector<double> points_sampled(points_rowcol.size(), std::numeric_limits<double>::quiet_NaN());
+    T sample_initializer_value{};
+    if constexpr (std::is_floating_point<T>::value) {
+        sample_initializer_value = std::numeric_limits<T>::quiet_NaN();
+    } else {
+        sample_initializer_value = std::numeric_limits<T>::max();
+    }
+
+    std::vector<T> points_sampled(points_rowcol.size(), sample_initializer_value);
     
-    std::vector<float> block_buffer{};
+    std::vector<T> block_buffer{};
     block_buffer.reserve(rs.blockxsize*rs.blockysize);
 
     for (const auto& [proxy_index, linear_index] : window_indices) {
@@ -496,6 +531,68 @@ std::vector<double> sample_points_from_band(GDALRasterBand* band, const std::vec
     }
 
     return points_sampled;
+}
+
+CPLErr dispatch_sample_and_write(const GDALDataType raster_dt,
+                                 GDALRasterBand* band,
+                                 const std::vector<GeographicCoordinate>& points,
+                                 const std::vector<ArrayCoordinate>& points_rowcol,
+                                 const std::vector<size_t>& points_proxy,
+                                 const std::vector<std::pair<size_t, size_t>>& window_indices,
+                                 const RasterShape& rs,
+                                 const OGRSpatialReference* target_sref,
+                                 OGRCoordinateTransformation* target_point_transform,
+                                 const Arguments& args)
+{
+    switch (raster_dt) {
+        case GDT_Float32:
+            {
+                const auto points_sampled = sample_points_from_band<float>(band, points_rowcol, points_proxy, window_indices, rs);
+                return write_points_to_geofile<float>(args.output_points, points, points_sampled, raster_dt, target_sref, target_point_transform, args.output_format);
+            }
+        case GDT_Float64:
+            {
+                const auto points_sampled = sample_points_from_band<double>(band, points_rowcol, points_proxy, window_indices, rs);
+                return write_points_to_geofile<double>(args.output_points, points, points_sampled, raster_dt, target_sref, target_point_transform, args.output_format);
+            }
+        case GDT_UInt16:
+            {
+                const auto points_sampled = sample_points_from_band<uint16_t>(band, points_rowcol, points_proxy, window_indices, rs);
+                return write_points_to_geofile<uint16_t>(args.output_points, points, points_sampled, raster_dt, target_sref, target_point_transform, args.output_format);
+            }
+        case GDT_UInt32:
+            {
+                const auto points_sampled = sample_points_from_band<uint32_t>(band, points_rowcol, points_proxy, window_indices, rs);
+                return write_points_to_geofile<uint32_t>(args.output_points, points, points_sampled, raster_dt, target_sref, target_point_transform, args.output_format);
+            }
+        case GDT_UInt64:
+            {
+                const auto points_sampled = sample_points_from_band<uint64_t>(band, points_rowcol, points_proxy, window_indices, rs);
+                return write_points_to_geofile<uint64_t>(args.output_points, points, points_sampled, raster_dt, target_sref, target_point_transform, args.output_format);
+            }
+        case GDT_Int8:
+            {
+                const auto points_sampled = sample_points_from_band<int8_t>(band, points_rowcol, points_proxy, window_indices, rs);
+                return write_points_to_geofile<int8_t>(args.output_points, points, points_sampled, raster_dt, target_sref, target_point_transform, args.output_format);
+            }
+        case GDT_Int16:
+            {
+                const auto points_sampled = sample_points_from_band<int16_t>(band, points_rowcol, points_proxy, window_indices, rs);
+                return write_points_to_geofile<int16_t>(args.output_points, points, points_sampled, raster_dt, target_sref, target_point_transform, args.output_format);
+            }
+        case GDT_Int32:
+            {
+                const auto points_sampled = sample_points_from_band<int32_t>(band, points_rowcol, points_proxy, window_indices, rs);
+                return write_points_to_geofile<int32_t>(args.output_points, points, points_sampled, raster_dt, target_sref, target_point_transform, args.output_format);
+            }
+        case GDT_Int64:
+            {
+                const auto points_sampled = sample_points_from_band<int64_t>(band, points_rowcol, points_proxy, window_indices, rs);
+                return write_points_to_geofile<int64_t>(args.output_points, points, points_sampled, raster_dt, target_sref, target_point_transform, args.output_format);
+            }
+        default:
+            return CE_Failure;
+    }
 }
 
 int main(int argc, const char* argv[]) {
@@ -613,9 +710,9 @@ int main(int argc, const char* argv[]) {
 
     const auto window_indices = calculate_nonempty_window_indices(points_proxy, points_rowcol, in_bounds, rs);
 
-    const auto points_sampled = sample_points_from_band(band, points_rowcol, points_proxy, window_indices, rs);
-
-    if (write_points_to_geofile(args.output_points, points, points_sampled, target_sref, target_point_transform, args.output_format) != CE_None) {
+    if (dispatch_sample_and_write(band->GetRasterDataType(), band, points, points_rowcol, points_proxy,
+                                  window_indices, rs, target_sref, target_point_transform, args) != CE_None)
+    {
         std::cerr << "Error writing result\n";
         return 1;
     }
