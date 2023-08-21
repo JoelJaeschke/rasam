@@ -6,3 +6,5 @@ if(MSVC)
 else()
   target_compile_options(rasam PRIVATE -Wall -Wextra -Wpedantic -Werror)
 endif()
+
+install(TARGETS rasam DESTINATION bin)
