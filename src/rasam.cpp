@@ -24,7 +24,7 @@
 #include "cpl_string.h"
 
 using GeoTransform = std::array<double, 6>;
-using ArrayIndex_t = uint32_t;
+using ArrayIndex_t = size_t;
 using Row = ArrayIndex_t;
 using Column = ArrayIndex_t;
 using ArrayCoordinate = std::pair<Column, Row>;
@@ -123,15 +123,15 @@ std::vector<ArrayCoordinate> projection_to_rowcol(const GeoTransform& gt, const 
 }
 
 size_t rowcol_to_linear_index(const ArrayCoordinate& rowcol, const RasterShape& rs) {
-    const size_t x_block = std::floor(rowcol.first / rs.blockxsize);
-    const size_t y_block = std::floor(rowcol.second / rs.blockysize);
+    const size_t x_block = static_cast<size_t>(std::floor(rowcol.first / rs.blockxsize));
+    const size_t y_block = static_cast<size_t>(std::floor(rowcol.second / rs.blockysize));
     const size_t linear_index = y_block * rs.size_x + x_block;
 
     return linear_index;
 }
 
 ArrayCoordinate linear_index_to_rowcol(const size_t linear_index, const RasterShape& rs) {
-    const ArrayIndex_t row = std::floor(static_cast<double>(linear_index) / static_cast<double>(rs.size_x));
+    const ArrayIndex_t row = static_cast<ArrayIndex_t>(std::floor(static_cast<double>(linear_index) / static_cast<double>(rs.size_x)));
     const ArrayIndex_t col = linear_index - row*rs.size_x;
 
     return std::make_pair(col, row);
@@ -641,7 +641,7 @@ int main(int argc, const char* argv[]) {
         return 1;
     }
 
-    GDALRasterBand* band = input_raster->GetRasterBand(args.raster_band);
+    GDALRasterBand* band = input_raster->GetRasterBand(static_cast<int>(args.raster_band));
     if (!band) {
         std::cerr << "Could not read band " << args.raster_band << " from raster\n";
         return 1;
