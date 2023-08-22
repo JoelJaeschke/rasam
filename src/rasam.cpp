@@ -95,7 +95,8 @@ private:
     double lry;
 public:
     RasterBounds(const GeoTransform& gt, const size_t rastersize_x, const size_t rastersize_y) {
-        ulx = gt[0]; uly = gt[3] + rastersize_y*gt[5]; lrx = gt[0] + rastersize_x*gt[1]; lry = gt[3];
+        ulx = gt[0]; uly = gt[3] + static_cast<double>(rastersize_y)*gt[5];
+        lrx = gt[0] + static_cast<double>(rastersize_x)*gt[1]; lry = gt[3];
     };
     ~RasterBounds() = default;
 
@@ -503,9 +504,9 @@ std::vector<T> sample_points_from_band(GDALRasterBand* band,
         size_t current_point = proxy_index;
         const auto [block_x, block_y] = linear_index_to_rowcol(linear_index, rs);
         int valid_blocksize_x{}, valid_blocksize_y{};
-        band->GetActualBlockSize(block_x, block_y, &valid_blocksize_x, &valid_blocksize_y);
+        band->GetActualBlockSize(static_cast<int>(block_x), static_cast<int>(block_y), &valid_blocksize_x, &valid_blocksize_y);
 
-        if (band->ReadBlock(block_x, block_y, block_buffer.data()) != CE_None) {
+        if (band->ReadBlock(static_cast<int>(block_x), static_cast<int>(block_y), block_buffer.data()) != CE_None) {
             throw std::runtime_error("Error reading block!");
         }
 
@@ -596,7 +597,7 @@ CPLErr dispatch_sample_and_write(const GDALDataType raster_dt,
 }
 
 int main(int argc, const char* argv[]) {
-    if (argc <= 3) {
+    if (argc <= 3 || std::string(argv[1]).compare("-h") == 0) {
         print_usage();
         return 0;
     };
