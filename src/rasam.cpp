@@ -276,7 +276,12 @@ void parse_cli_args(const int argc, const char* argv[], Arguments& args) {
         }
         
         if (current_arg.compare("-b") == 0 || current_arg.compare("--band") == 0) {
-            args.raster_band = std::stoi(argv[current_arg_idx + 1]);
+            const int raster_band = std::stoi(argv[current_arg_idx + 1]);
+            if (raster_band < 1) {
+                args.raster_band = 0;
+            } else {
+                args.raster_band = static_cast<size_t>(raster_band);
+            }
             current_arg_idx += 2;
             continue;
         }
@@ -289,7 +294,7 @@ void parse_cli_args(const int argc, const char* argv[], Arguments& args) {
                 break;
             }
 
-            args.cache_size = cache_size;
+            args.cache_size = static_cast<size_t>(cache_size);
             current_arg_idx += 2;
             continue;
         }
@@ -504,7 +509,9 @@ std::vector<T> sample_points_from_band(GDALRasterBand* band,
         size_t current_point = proxy_index;
         const auto [block_x, block_y] = linear_index_to_rowcol(linear_index, rs);
         int valid_blocksize_x{}, valid_blocksize_y{};
-        band->GetActualBlockSize(static_cast<int>(block_x), static_cast<int>(block_y), &valid_blocksize_x, &valid_blocksize_y);
+        if (band->GetActualBlockSize(static_cast<int>(block_x), static_cast<int>(block_y), &valid_blocksize_x, &valid_blocksize_y) != CE_None) {
+            throw std::runtime_error("Error reading true blocksize!");
+        };
 
         if (band->ReadBlock(static_cast<int>(block_x), static_cast<int>(block_y), block_buffer.data()) != CE_None) {
             throw std::runtime_error("Error reading block!");
@@ -512,8 +519,8 @@ std::vector<T> sample_points_from_band(GDALRasterBand* band,
 
         // The left edge is always multiples of the full blocksize from the origin
         // while the right edge may not be a full block size away due to partial blocks
-        const size_t block_xmin = block_x*rs.blockxsize, block_xmax = block_xmin + valid_blocksize_x;
-        const size_t block_ymin = block_y*rs.blockysize, block_ymax = block_ymin + valid_blocksize_y;
+        const size_t block_xmin = block_x*rs.blockxsize, block_xmax = block_xmin + static_cast<size_t>(valid_blocksize_x);
+        const size_t block_ymin = block_y*rs.blockysize, block_ymax = block_ymin + static_cast<size_t>(valid_blocksize_y);
         
         while (true) {
             const auto point_index = points_proxy[current_point];
@@ -699,7 +706,11 @@ int main(int argc, const char* argv[]) {
     }
 
     const RasterShape rs = raster_shape_from_band(band);
-    const RasterBounds rb(gt_ir, input_raster->GetRasterXSize(), input_raster->GetRasterYSize());
+    const RasterBounds rb(
+        gt_ir,
+        static_cast<size_t>(input_raster->GetRasterXSize()),
+        static_cast<size_t>(input_raster->GetRasterYSize())
+    );
 
     const auto points = read_points_from_geofile(point_layer, source_point_transform);
     const auto in_bounds = calculate_points_in_bounds_mask(points, rb);
